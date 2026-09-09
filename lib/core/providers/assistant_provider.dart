@@ -693,6 +693,20 @@ class AssistantProvider extends ChangeNotifier {
     return copy.id;
   }
 
+  /// Applies [transform] to the latest in-memory assistant before persisting.
+  ///
+  /// Callers editing a page must use this instead of retaining an Assistant
+  /// snapshot from build(), otherwise a concurrent update can overwrite newer
+  /// fields with stale values.
+  Future<void> transformAssistant(
+    String id,
+    Assistant Function(Assistant current) transform,
+  ) async {
+    final current = getById(id);
+    if (current == null) return;
+    await updateAssistant(transform(current));
+  }
+
   Future<void> updateAssistant(Assistant updated) async {
     final idx = _assistants.indexWhere((a) => a.id == updated.id);
     if (idx == -1) return;

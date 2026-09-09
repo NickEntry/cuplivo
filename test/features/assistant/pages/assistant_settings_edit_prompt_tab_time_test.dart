@@ -128,6 +128,44 @@ Finder get _warningIcons =>
 void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
 
+  testWidgets('prompt input is debounced and saves the final text', (tester) async {
+    _seedPreferences();
+    await _openPromptsTab(tester);
+
+    final fields = find.byType(TextField);
+    expect(fields, findsNWidgets(2));
+    await tester.enterText(fields.at(0), '完整的系统提示词：中文🙂\n```code```');
+    await tester.pump(const Duration(milliseconds: 799));
+    final provider = tester.element(find.byType(AssistantSettingsEditPage))
+        .read<AssistantProvider>();
+    expect(provider.getById(_assistantId)?.systemPrompt, isEmpty);
+
+    await tester.pump(const Duration(milliseconds: 1));
+    await tester.pump();
+    expect(
+      provider.getById(_assistantId)?.systemPrompt,
+      '完整的系统提示词：中文🙂\n```code```',
+    );
+  });
+
+  testWidgets('system and template edits are persisted together', (tester) async {
+    _seedPreferences();
+    await _openPromptsTab(tester);
+
+    final fields = find.byType(TextField);
+    expect(fields, findsNWidgets(2));
+    await tester.enterText(fields.at(0), 'system final');
+    await tester.enterText(fields.at(1), '{{ role }}: {{ message }}');
+    await tester.pump(const Duration(milliseconds: 800));
+    await tester.pump();
+
+    final provider = tester.element(find.byType(AssistantSettingsEditPage))
+        .read<AssistantProvider>();
+    final assistant = provider.getById(_assistantId)!;
+    expect(assistant.systemPrompt, 'system final');
+    expect(assistant.messageTemplate, '{{ role }}: {{ message }}');
+  });
+
   testWidgets(
     'volatile variables get a warning badge in the system prompt list',
     (tester) async {

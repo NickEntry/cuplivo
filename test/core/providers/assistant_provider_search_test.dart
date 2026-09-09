@@ -68,6 +68,27 @@ void main() {
       },
     );
 
+    test('transformAssistant preserves fields changed after a stale snapshot', () async {
+      final provider = await _createLoadedAssistantProvider(
+        preferences: businessPrefs,
+        assistants: const [
+          {'id': 'assistant-a', 'name': 'A'},
+        ],
+      );
+
+      final stale = provider.getById('assistant-a')!;
+      await provider.updateAssistant(stale.copyWith(messageTemplate: 'latest'));
+
+      await provider.transformAssistant(
+        'assistant-a',
+        (current) => current.copyWith(systemPrompt: 'new system prompt'),
+      );
+
+      final updated = provider.getById('assistant-a')!;
+      expect(updated.systemPrompt, 'new system prompt');
+      expect(updated.messageTemplate, 'latest');
+    });
+
     test('updates only the current assistant search value', () async {
       final provider = await _createLoadedAssistantProvider(
         preferences: businessPrefs,

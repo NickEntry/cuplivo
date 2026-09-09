@@ -17,12 +17,17 @@ class _PromptTabState extends State<_PromptTab> {
   bool _showPresetInput = false;
   String _presetRole = 'user';
   final GlobalKey _presetHeaderKey = GlobalKey(debugLabel: 'presetHeader');
+  Timer? _promptSaveTimer;
+  String? _pendingSystemPrompt;
+  String? _pendingMessageTemplate;
+  int _promptRevision = 0;
+  late final AssistantProvider _assistantProvider;
 
   @override
   void initState() {
     super.initState();
-    final ap = context.read<AssistantProvider>();
-    final a = ap.getById(widget.assistantId)!;
+    _assistantProvider = context.read<AssistantProvider>();
+    final a = _assistantProvider.getById(widget.assistantId)!;
     _sysCtrl = TextEditingController(text: a.systemPrompt);
     _tmplCtrl = TextEditingController(text: a.messageTemplate);
     _sysFocus = FocusNode(debugLabel: 'systemPromptFocus');
@@ -34,8 +39,14 @@ class _PromptTabState extends State<_PromptTab> {
   void didUpdateWidget(covariant _PromptTab oldWidget) {
     super.didUpdateWidget(oldWidget);
     if (oldWidget.assistantId != widget.assistantId) {
-      final ap = context.read<AssistantProvider>();
-      final a = ap.getById(widget.assistantId)!;
+      final pending = _takePendingPromptChanges();
+      unawaited(_persistPromptSnapshot(
+        _assistantProvider,
+        oldWidget.assistantId,
+        pending.$1,
+        pending.$2,
+      ));
+      final a = _assistantProvider.getById(widget.assistantId)!;
       _sysCtrl.text = a.systemPrompt;
       _tmplCtrl.text = a.messageTemplate;
     }
@@ -43,6 +54,14 @@ class _PromptTabState extends State<_PromptTab> {
 
   @override
   void dispose() {
+    _promptSaveTimer?.cancel();
+    final pending = _takePendingPromptChanges();
+    unawaited(_persistPromptSnapshot(
+      _assistantProvider,
+      widget.assistantId,
+      pending.$1,
+      pending.$2,
+    ));
     _sysCtrl.dispose();
     _tmplCtrl.dispose();
     _sysFocus.dispose();
@@ -66,6 +85,61 @@ class _PromptTabState extends State<_PromptTab> {
       selection: TextSelection.collapsed(offset: start + toInsert.length),
       composing: TextRange.empty,
     );
+  }
+
+  void _schedulePromptSave({String? systemPrompt, String? messageTemplate}) {
+    if (systemPrompt != null) _pendingSystemPrompt = systemPrompt;
+    if (messageTemplate != null) _pendingMessageTemplate = messageTemplate;
+    final revision = ++_promptRevision;
+    _promptSaveTimer?.cancel();
+    _promptSaveTimer = Timer(const Duration(milliseconds: 800), () {
+      if (revision == _promptRevision) unawaited(_flushPromptChanges());
+    });
+  }
+
+  (String?, String?) _takePendingPromptChanges() {
+    _promptSaveTimer?.cancel();
+    _promptSaveTimer = null;
+    final pending = (_pendingSystemPrompt, _pendingMessageTemplate);
+    _pendingSystemPrompt = null;
+    _pendingMessageTemplate = null;
+    return pending;
+  }
+
+  Future<void> _flushPromptChanges() async {
+    final pending = _takePendingPromptChanges();
+    await _persistPromptSnapshot(
+      _assistantProvider,
+      widget.assistantId,
+      pending.$1,
+      pending.$2,
+    );
+  }
+
+  Future<void> _persistPromptSnapshot(
+    AssistantProvider provider,
+    String assistantId,
+    String? systemPrompt,
+    String? messageTemplate,
+  ) async {
+    if (systemPrompt == null && messageTemplate == null) return;
+    await provider.transformAssistant(
+      assistantId,
+      (current) => current.copyWith(
+        systemPrompt: systemPrompt ?? current.systemPrompt,
+        messageTemplate: messageTemplate ?? current.messageTemplate,
+      ),
+    );
+  }
+
+  void _onSystemPromptChanged(String value) {
+    _schedulePromptSave(systemPrompt: value);
+    if (mounted) setState(() {});
+  }
+
+  void _onMessageTemplateChanged(String value) {
+    _schedulePromptSave(messageTemplate: value);
+    if (mounted) setState(() {});
   }
 
   Future<void> _importSystemPrompt() async {
@@ -115,11 +189,11 @@ class _PromptTabState extends State<_PromptTab> {
       _sysCtrl.selection = TextSelection.collapsed(
         offset: _sysCtrl.text.length,
       );
-      final ap = context.read<AssistantProvider>();
-      final a = ap.getById(widget.assistantId);
-      if (a != null) {
-        await ap.updateAssistant(a.copyWith(systemPrompt: _sysCtrl.text));
-      }
+      await _flushPromptChanges();
+      await context.read<AssistantProvider>().transformAssistant(
+        widget.assistantId,
+        (current) => current.copyWith(systemPrompt: _sysCtrl.text),
+      );
       if (!mounted) return;
       showAppSnackBar(
         context,
@@ -138,12 +212,13 @@ class _PromptTabState extends State<_PromptTab> {
   }
 
   Future<void> _applySystemPromptChange(String value) async {
-    final ap = context.read<AssistantProvider>();
-    final a = ap.getById(widget.assistantId);
-    if (a == null) return;
+    await _flushPromptChanges();
     _sysCtrl.text = value;
     _sysCtrl.selection = TextSelection.collapsed(offset: _sysCtrl.text.length);
-    await ap.updateAssistant(a.copyWith(systemPrompt: value));
+    await context.read<AssistantProvider>().transformAssistant(
+      widget.assistantId,
+      (current) => current.copyWith(systemPrompt: value),
+    );
     if (mounted) setState(() {});
   }
 
@@ -215,8 +290,10 @@ class _PromptTabState extends State<_PromptTab> {
         }
       }
     }
-    await context.read<AssistantProvider>().updateAssistant(
-      a.copyWith(enableTimeInjection: enabled),
+    await _flushPromptChanges();
+    await context.read<AssistantProvider>().transformAssistant(
+      widget.assistantId,
+      (current) => current.copyWith(enableTimeInjection: enabled),
     );
   }
 
@@ -358,9 +435,7 @@ class _PromptTabState extends State<_PromptTab> {
             TextField(
               controller: _sysCtrl,
               focusNode: _sysFocus,
-              onChanged: (v) => context
-                  .read<AssistantProvider>()
-                  .updateAssistant(a.copyWith(systemPrompt: v)),
+              onChanged: _onSystemPromptChanged,
               // minLines: 1,
               maxLines: 8,
               keyboardType: TextInputType.multiline,
@@ -424,9 +499,7 @@ class _PromptTabState extends State<_PromptTab> {
               cacheWarningTooltip: l10n.assistantEditPromptTimeVarWarning,
               onTapVar: (v) {
                 _insertAtCursor(_sysCtrl, v);
-                context.read<AssistantProvider>().updateAssistant(
-                  a.copyWith(systemPrompt: _sysCtrl.text),
-                );
+                _schedulePromptSave(systemPrompt: _sysCtrl.text);
                 // Restore focus to the input to keep cursor active
                 Future.microtask(() => _sysFocus.requestFocus());
               },
@@ -512,9 +585,7 @@ class _PromptTabState extends State<_PromptTab> {
               keyboardType: TextInputType.multiline,
               textInputAction: TextInputAction.newline,
               enableInteractiveSelection: true,
-              onChanged: (v) => context
-                  .read<AssistantProvider>()
-                  .updateAssistant(a.copyWith(messageTemplate: v)),
+              onChanged: _onMessageTemplateChanged,
               decoration: InputDecoration(
                 hintText: '{{ message }}',
                 border: OutlineInputBorder(
@@ -556,9 +627,7 @@ class _PromptTabState extends State<_PromptTab> {
                     ? (_) {}
                     : (v) {
                         _insertAtCursor(_tmplCtrl, v);
-                        context.read<AssistantProvider>().updateAssistant(
-                          a.copyWith(messageTemplate: _tmplCtrl.text),
-                        );
+                        _schedulePromptSave(messageTemplate: _tmplCtrl.text);
                         Future.microtask(() => _tmplFocus.requestFocus());
                       },
               ),
@@ -775,11 +844,15 @@ class _PromptTabState extends State<_PromptTab> {
                   },
                   itemCount: items.length,
                   onReorderItem: (oldIndex, newIndex) async {
-                    final list = List<PresetMessage>.of(a.presetMessages);
-                    final item = list.removeAt(oldIndex);
-                    list.insert(newIndex, item);
-                    await context.read<AssistantProvider>().updateAssistant(
-                      a.copyWith(presetMessages: list),
+                    await _flushPromptChanges();
+                    await context.read<AssistantProvider>().transformAssistant(
+                      widget.assistantId,
+                      (current) {
+                        final list = List<PresetMessage>.of(current.presetMessages);
+                        final item = list.removeAt(oldIndex);
+                        list.insert(newIndex, item);
+                        return current.copyWith(presetMessages: list);
+                      },
                     );
                   },
                   itemBuilder: (ctx, i) {
@@ -787,12 +860,20 @@ class _PromptTabState extends State<_PromptTab> {
                     final card = _PresetMessageCard(
                       role: m.role,
                       content: m.content,
-                      onEdit: () async => _showEditPresetDialog(context, a, m),
+                      onEdit: () async => _showEditPresetDialog(
+                        context,
+                        widget.assistantId,
+                        m,
+                      ),
                       onDelete: () async {
-                        final list = List<PresetMessage>.of(a.presetMessages);
-                        list.removeWhere((e) => e.id == m.id);
-                        await context.read<AssistantProvider>().updateAssistant(
-                          a.copyWith(presetMessages: list),
+                        await _flushPromptChanges();
+                        await context.read<AssistantProvider>().transformAssistant(
+                          widget.assistantId,
+                          (current) => current.copyWith(
+                            presetMessages: current.presetMessages
+                                .where((e) => e.id != m.id)
+                                .toList(),
+                          ),
                         );
                       },
                     );
@@ -857,19 +938,20 @@ class _PromptTabState extends State<_PromptTab> {
                                 onSubmitted: (_) async {
                                   final text = _presetCtrl.text.trim();
                                   if (text.isEmpty) return;
-                                  final list = List<PresetMessage>.of(
-                                    a.presetMessages,
-                                  );
-                                  list.add(
-                                    PresetMessage(
-                                      role: _presetRole,
-                                      content: text,
-                                    ),
-                                  );
+                                  await _flushPromptChanges();
                                   await context
                                       .read<AssistantProvider>()
-                                      .updateAssistant(
-                                        a.copyWith(presetMessages: list),
+                                      .transformAssistant(
+                                        widget.assistantId,
+                                        (current) => current.copyWith(
+                                          presetMessages: [
+                                            ...current.presetMessages,
+                                            PresetMessage(
+                                              role: _presetRole,
+                                              content: text,
+                                            ),
+                                          ],
+                                        ),
                                       );
                                   if (!mounted) return;
                                   setState(() {
@@ -899,19 +981,20 @@ class _PromptTabState extends State<_PromptTab> {
                                     onTap: () async {
                                       final text = _presetCtrl.text.trim();
                                       if (text.isEmpty) return;
-                                      final list = List<PresetMessage>.of(
-                                        a.presetMessages,
-                                      );
-                                      list.add(
-                                        PresetMessage(
-                                          role: _presetRole,
-                                          content: text,
-                                        ),
-                                      );
+                                      await _flushPromptChanges();
                                       await context
                                           .read<AssistantProvider>()
-                                          .updateAssistant(
-                                            a.copyWith(presetMessages: list),
+                                          .transformAssistant(
+                                            widget.assistantId,
+                                            (current) => current.copyWith(
+                                              presetMessages: [
+                                                ...current.presetMessages,
+                                                PresetMessage(
+                                                  role: _presetRole,
+                                                  content: text,
+                                                ),
+                                              ],
+                                            ),
                                           );
                                       if (!mounted) return;
                                       setState(() {
@@ -1417,7 +1500,7 @@ class _HoverPillButtonState extends State<_HoverPillButton> {
 
 Future<void> _showEditPresetDialog(
   BuildContext context,
-  Assistant a,
+  String assistantId,
   PresetMessage m,
 ) async {
   final l10n = AppLocalizations.of(context)!;
@@ -1431,13 +1514,16 @@ Future<void> _showEditPresetDialog(
   Future<void> save() async {
     final text = controller.text.trim();
     if (text.isEmpty) return;
-    final list = List<PresetMessage>.of(a.presetMessages);
-    final idx = list.indexWhere((e) => e.id == m.id);
-    if (idx != -1) {
-      list[idx] = list[idx].copyWith(content: text);
-    }
-    await context.read<AssistantProvider>().updateAssistant(
-      a.copyWith(presetMessages: list),
+    await context.read<AssistantProvider>().transformAssistant(
+      assistantId,
+      (current) {
+        final list = List<PresetMessage>.of(current.presetMessages);
+        final idx = list.indexWhere((e) => e.id == m.id);
+        if (idx != -1) {
+          list[idx] = list[idx].copyWith(content: text);
+        }
+        return current.copyWith(presetMessages: list);
+      },
     );
   }
 
