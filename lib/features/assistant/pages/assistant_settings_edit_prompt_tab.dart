@@ -190,7 +190,7 @@ class _PromptTabState extends State<_PromptTab> {
         offset: _sysCtrl.text.length,
       );
       await _flushPromptChanges();
-      await context.read<AssistantProvider>().transformAssistant(
+      await _assistantProvider.transformAssistant(
         widget.assistantId,
         (current) => current.copyWith(systemPrompt: _sysCtrl.text),
       );
@@ -215,7 +215,7 @@ class _PromptTabState extends State<_PromptTab> {
     await _flushPromptChanges();
     _sysCtrl.text = value;
     _sysCtrl.selection = TextSelection.collapsed(offset: _sysCtrl.text.length);
-    await context.read<AssistantProvider>().transformAssistant(
+    await _assistantProvider.transformAssistant(
       widget.assistantId,
       (current) => current.copyWith(systemPrompt: value),
     );
@@ -276,7 +276,7 @@ class _PromptTabState extends State<_PromptTab> {
     await _applySystemPromptChange(next);
   }
 
-  Future<void> _onAppendCurrentTimeChanged(Assistant a, bool enabled) async {
+  Future<void> _onAppendCurrentTimeChanged(bool enabled) async {
     if (enabled) {
       final hits = ChatContextTransforms.detectTimeVariables(_sysCtrl.text);
       if (hits.isNotEmpty) {
@@ -291,7 +291,7 @@ class _PromptTabState extends State<_PromptTab> {
       }
     }
     await _flushPromptChanges();
-    await context.read<AssistantProvider>().transformAssistant(
+    await _assistantProvider.transformAssistant(
       widget.assistantId,
       (current) => current.copyWith(enableTimeInjection: enabled),
     );
@@ -552,7 +552,7 @@ class _PromptTabState extends State<_PromptTab> {
       children: [
         _AppendCurrentTimeRow(
           value: a.enableTimeInjection,
-          onChanged: (enabled) => _onAppendCurrentTimeChanged(a, enabled),
+          onChanged: _onAppendCurrentTimeChanged,
           onInfoTap: () => _showAppendCurrentTimeInfoDialog(context),
         ),
       ],
@@ -845,7 +845,7 @@ class _PromptTabState extends State<_PromptTab> {
                   itemCount: items.length,
                   onReorderItem: (oldIndex, newIndex) async {
                     await _flushPromptChanges();
-                    await context.read<AssistantProvider>().transformAssistant(
+                    await _assistantProvider.transformAssistant(
                       widget.assistantId,
                       (current) {
                         final list = List<PresetMessage>.of(current.presetMessages);
@@ -867,7 +867,7 @@ class _PromptTabState extends State<_PromptTab> {
                       ),
                       onDelete: () async {
                         await _flushPromptChanges();
-                        await context.read<AssistantProvider>().transformAssistant(
+                        await _assistantProvider.transformAssistant(
                           widget.assistantId,
                           (current) => current.copyWith(
                             presetMessages: current.presetMessages
@@ -939,9 +939,7 @@ class _PromptTabState extends State<_PromptTab> {
                                   final text = _presetCtrl.text.trim();
                                   if (text.isEmpty) return;
                                   await _flushPromptChanges();
-                                  await context
-                                      .read<AssistantProvider>()
-                                      .transformAssistant(
+                                  await _assistantProvider.transformAssistant(
                                         widget.assistantId,
                                         (current) => current.copyWith(
                                           presetMessages: [
@@ -982,9 +980,7 @@ class _PromptTabState extends State<_PromptTab> {
                                       final text = _presetCtrl.text.trim();
                                       if (text.isEmpty) return;
                                       await _flushPromptChanges();
-                                      await context
-                                          .read<AssistantProvider>()
-                                          .transformAssistant(
+                                      await _assistantProvider.transformAssistant(
                                             widget.assistantId,
                                             (current) => current.copyWith(
                                               presetMessages: [
