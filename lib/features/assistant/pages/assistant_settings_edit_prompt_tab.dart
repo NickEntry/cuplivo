@@ -9,40 +9,110 @@ class _PromptTab extends StatefulWidget {
 }
 
 class _PromptTabState extends State<_PromptTab> {
-  late final TextEditingController _sysCtrl;
-  late final TextEditingController _tmplCtrl;
+  late CodeLineEditingController _sysCtrl;
+  late CodeLineEditingController _tmplCtrl;
   late final FocusNode _sysFocus;
   late final FocusNode _tmplFocus;
   late final TextEditingController _presetCtrl;
   bool _showPresetInput = false;
   String _presetRole = 'user';
   final GlobalKey _presetHeaderKey = GlobalKey(debugLabel: 'presetHeader');
+  Timer? _promptSaveTimer;
+  String? _pendingSystemPrompt;
+  String? _pendingMessageTemplate;
+  bool _hasPendingSystemPrompt = false;
+  bool _hasPendingMessageTemplate = false;
+  int _promptSaveGeneration = 0;
+  Future<void> _promptSaveChain = Future<void>.value();
+  late AssistantProvider _assistantProvider;
+  bool _sysEditorHasBeenFocused = false;
+  bool _tmplEditorHasBeenFocused = false;
 
   @override
   void initState() {
     super.initState();
-    final ap = context.read<AssistantProvider>();
+    _assistantProvider = context.read<AssistantProvider>();
+    final ap = _assistantProvider;
     final a = ap.getById(widget.assistantId)!;
-    _sysCtrl = TextEditingController(text: a.systemPrompt);
-    _tmplCtrl = TextEditingController(text: a.messageTemplate);
-    _sysFocus = FocusNode(debugLabel: 'systemPromptFocus');
-    _tmplFocus = FocusNode(debugLabel: 'messageTemplateFocus');
+    _sysCtrl = createPlainTextCodeController(a.systemPrompt);
+    _tmplCtrl = createPlainTextCodeController(a.messageTemplate);
+    _sysFocus = FocusNode(debugLabel: 'systemPromptFocus')
+      ..addListener(_onSystemFocusChanged);
+    _tmplFocus = FocusNode(debugLabel: 'messageTemplateFocus')
+      ..addListener(_onTemplateFocusChanged);
     _presetCtrl = TextEditingController();
+  }
+
+  void _moveCaretToDocumentEnd(CodeLineEditingController controller) {
+    final lastIndex = controller.lineCount - 1;
+    controller.selection = CodeLineSelection.collapsed(
+      index: lastIndex,
+      offset: controller.codeLines[lastIndex].text.length,
+    );
+  }
+
+  /// Rebuilds the system-prompt controller around [text].
+  ///
+  /// `CodeLineEditingController` fixes its line break when it is constructed
+  /// and re-joins the document with that same break afterwards, so assigning
+  /// `controller.text` cannot carry CRLF bytes: the document is normalised to
+  /// LF and the next edit would persist that normalisation, silently rewriting
+  /// an imported prompt. Rebuilding the controller keeps imported content
+  /// byte-exact, mirroring what `didUpdateWidget` already does when the
+  /// assistant changes.
+  void _replaceSystemPromptController(String text) {
+    final oldController = _sysCtrl;
+    _sysCtrl = createPlainTextCodeController(text);
+    _moveCaretToDocumentEnd(_sysCtrl);
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      oldController.dispose();
+    });
+    if (mounted) setState(() {});
+  }
+
+  void _onSystemPromptChanged() {
+    _schedulePromptSave(systemPrompt: _sysCtrl.text);
+  }
+
+  void _onMessageTemplateChanged() {
+    _schedulePromptSave(messageTemplate: _tmplCtrl.text);
+  }
+
+  void _onSystemFocusChanged() {
+    if (_sysFocus.hasFocus) _sysEditorHasBeenFocused = true;
+  }
+
+  void _onTemplateFocusChanged() {
+    if (_tmplFocus.hasFocus) _tmplEditorHasBeenFocused = true;
   }
 
   @override
   void didUpdateWidget(covariant _PromptTab oldWidget) {
     super.didUpdateWidget(oldWidget);
     if (oldWidget.assistantId != widget.assistantId) {
+      final oldAssistantId = oldWidget.assistantId;
+      unawaited(_flushPromptChanges(assistantId: oldAssistantId));
       final ap = context.read<AssistantProvider>();
       final a = ap.getById(widget.assistantId)!;
-      _sysCtrl.text = a.systemPrompt;
-      _tmplCtrl.text = a.messageTemplate;
+      _sysFocus.unfocus();
+      _tmplFocus.unfocus();
+      _sysEditorHasBeenFocused = false;
+      _tmplEditorHasBeenFocused = false;
+      final oldSystemController = _sysCtrl;
+      final oldTemplateController = _tmplCtrl;
+      _sysCtrl = createPlainTextCodeController(a.systemPrompt);
+      _tmplCtrl = createPlainTextCodeController(a.messageTemplate);
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        oldSystemController.dispose();
+        oldTemplateController.dispose();
+      });
+      setState(() {});
     }
   }
 
   @override
   void dispose() {
+    unawaited(_flushPromptChanges());
     _sysCtrl.dispose();
     _tmplCtrl.dispose();
     _sysFocus.dispose();
@@ -51,21 +121,78 @@ class _PromptTabState extends State<_PromptTab> {
     super.dispose();
   }
 
-  void _insertAtCursor(TextEditingController controller, String toInsert) {
-    final text = controller.text;
-    final sel = controller.selection;
-    final start = (sel.start >= 0 && sel.start <= text.length)
-        ? sel.start
-        : text.length;
-    final end = (sel.end >= 0 && sel.end <= text.length && sel.end >= start)
-        ? sel.end
-        : start;
-    final nextText = text.replaceRange(start, end, toInsert);
-    controller.value = controller.value.copyWith(
-      text: nextText,
-      selection: TextSelection.collapsed(offset: start + toInsert.length),
-      composing: TextRange.empty,
-    );
+  void _insertAtCursor(
+    CodeLineEditingController controller,
+    bool hasBeenFocused,
+    String toInsert,
+  ) {
+    if (!hasBeenFocused) {
+      _moveCaretToDocumentEnd(controller);
+    }
+    controller.replaceSelection(toInsert);
+  }
+
+  void _schedulePromptSave({String? systemPrompt, String? messageTemplate}) {
+    if (systemPrompt != null) {
+      _pendingSystemPrompt = systemPrompt;
+      _hasPendingSystemPrompt = true;
+    }
+    if (messageTemplate != null) {
+      _pendingMessageTemplate = messageTemplate;
+      _hasPendingMessageTemplate = true;
+    }
+    _promptSaveTimer?.cancel();
+    final generation = ++_promptSaveGeneration;
+    _promptSaveTimer = Timer(const Duration(milliseconds: 800), () {
+      if (generation == _promptSaveGeneration) {
+        unawaited(_flushPromptChanges());
+      }
+    });
+  }
+
+  Future<void> _flushPromptChanges({String? assistantId}) {
+    _promptSaveTimer?.cancel();
+    _promptSaveTimer = null;
+    final systemPrompt = _pendingSystemPrompt;
+    final messageTemplate = _pendingMessageTemplate;
+    final hasSystemPrompt = _hasPendingSystemPrompt;
+    final hasMessageTemplate = _hasPendingMessageTemplate;
+    final targetAssistantId = assistantId ?? widget.assistantId;
+    _pendingSystemPrompt = null;
+    _pendingMessageTemplate = null;
+    _hasPendingSystemPrompt = false;
+    _hasPendingMessageTemplate = false;
+    if (!hasSystemPrompt && !hasMessageTemplate) {
+      return _promptSaveChain;
+    }
+
+    // Capture both provider and assistant id before this State can unmount or
+    // receive a new widget. The provider outlives the editor, and the target
+    // id must remain the id that owned the pending text.
+    final provider = _assistantProvider;
+    _promptSaveChain = _promptSaveChain
+        .catchError((Object error, StackTrace stackTrace) {
+          debugPrint('Prompt save failed: $error\n$stackTrace');
+        })
+        .then((_) async {
+          final current = provider.getById(targetAssistantId);
+          if (current == null) return;
+          try {
+            await provider.updateAssistant(
+              current.copyWith(
+                systemPrompt: hasSystemPrompt
+                    ? systemPrompt
+                    : current.systemPrompt,
+                messageTemplate: hasMessageTemplate
+                    ? messageTemplate
+                    : current.messageTemplate,
+              ),
+            );
+          } catch (error, stackTrace) {
+            debugPrint('Prompt save failed: $error\n$stackTrace');
+          }
+        });
+    return _promptSaveChain;
   }
 
   Future<void> _importSystemPrompt() async {
@@ -111,15 +238,9 @@ class _PromptTabState extends State<_PromptTab> {
         );
         return;
       }
-      _sysCtrl.text = content;
-      _sysCtrl.selection = TextSelection.collapsed(
-        offset: _sysCtrl.text.length,
-      );
-      final ap = context.read<AssistantProvider>();
-      final a = ap.getById(widget.assistantId);
-      if (a != null) {
-        await ap.updateAssistant(a.copyWith(systemPrompt: _sysCtrl.text));
-      }
+      _replaceSystemPromptController(content);
+      _schedulePromptSave(systemPrompt: content);
+      await _flushPromptChanges();
       if (!mounted) return;
       showAppSnackBar(
         context,
@@ -141,9 +262,9 @@ class _PromptTabState extends State<_PromptTab> {
     final ap = context.read<AssistantProvider>();
     final a = ap.getById(widget.assistantId);
     if (a == null) return;
-    _sysCtrl.text = value;
-    _sysCtrl.selection = TextSelection.collapsed(offset: _sysCtrl.text.length);
-    await ap.updateAssistant(a.copyWith(systemPrompt: value));
+    _replaceSystemPromptController(value);
+    _schedulePromptSave(systemPrompt: value);
+    await _flushPromptChanges();
     if (mounted) setState(() {});
   }
 
@@ -355,35 +476,22 @@ class _PromptTabState extends State<_PromptTab> {
               ],
             ),
             const SizedBox(height: 10),
-            TextField(
-              controller: _sysCtrl,
-              focusNode: _sysFocus,
-              onChanged: (v) => context
-                  .read<AssistantProvider>()
-                  .updateAssistant(a.copyWith(systemPrompt: v)),
-              // minLines: 1,
-              maxLines: 8,
-              keyboardType: TextInputType.multiline,
-              textInputAction: TextInputAction.newline,
-              enableInteractiveSelection: true,
-              decoration: InputDecoration(
-                hintText: l10n.assistantEditSystemPromptHint,
-                border: OutlineInputBorder(
-                  borderRadius: BorderRadius.circular(12),
+            Container(
+              height: 190,
+              decoration: BoxDecoration(
+                color: context.appColors.surfaceFill,
+                borderRadius: BorderRadius.circular(12),
+                border: Border.all(
+                  color: cs.outlineVariant.withValues(alpha: 0.35),
                 ),
-                enabledBorder: OutlineInputBorder(
-                  borderRadius: BorderRadius.circular(12),
-                  borderSide: BorderSide(
-                    color: cs.outlineVariant.withValues(alpha: 0.35),
-                  ),
-                ),
-                focusedBorder: OutlineInputBorder(
-                  borderRadius: BorderRadius.circular(12),
-                  borderSide: BorderSide(
-                    color: cs.primary.withValues(alpha: 0.5),
-                  ),
-                ),
-                contentPadding: const EdgeInsets.fromLTRB(12, 12, 12, 12),
+              ),
+              child: PlainTextCodeEditor(
+                controller: _sysCtrl,
+                focusNode: _sysFocus,
+                hint: l10n.assistantEditSystemPromptHint,
+                padding: const EdgeInsets.fromLTRB(12, 12, 12, 12),
+                borderRadius: BorderRadius.circular(12),
+                onChanged: (_) => _onSystemPromptChanged(),
               ),
             ),
             const SizedBox(height: 8),
@@ -423,10 +531,8 @@ class _PromptTabState extends State<_PromptTab> {
               },
               cacheWarningTooltip: l10n.assistantEditPromptTimeVarWarning,
               onTapVar: (v) {
-                _insertAtCursor(_sysCtrl, v);
-                context.read<AssistantProvider>().updateAssistant(
-                  a.copyWith(systemPrompt: _sysCtrl.text),
-                );
+                _insertAtCursor(_sysCtrl, _sysEditorHasBeenFocused, v);
+                _schedulePromptSave(systemPrompt: _sysCtrl.text);
                 // Restore focus to the input to keep cursor active
                 Future.microtask(() => _sysFocus.requestFocus());
               },
@@ -504,32 +610,26 @@ class _PromptTabState extends State<_PromptTab> {
               ),
             ),
             const SizedBox(height: 10),
-            TextField(
-              controller: _tmplCtrl,
-              focusNode: _tmplFocus,
-              enabled: !a.enableTimeInjection,
-              maxLines: 4,
-              keyboardType: TextInputType.multiline,
-              textInputAction: TextInputAction.newline,
-              enableInteractiveSelection: true,
-              onChanged: (v) => context
-                  .read<AssistantProvider>()
-                  .updateAssistant(a.copyWith(messageTemplate: v)),
-              decoration: InputDecoration(
-                hintText: '{{ message }}',
-                border: OutlineInputBorder(
-                  borderRadius: BorderRadius.circular(12),
-                ),
-                enabledBorder: OutlineInputBorder(
-                  borderRadius: BorderRadius.circular(12),
-                  borderSide: BorderSide(
-                    color: cs.outlineVariant.withValues(alpha: 0.35),
+            IgnorePointer(
+              ignoring: a.enableTimeInjection,
+              child: Opacity(
+                opacity: a.enableTimeInjection ? 0.5 : 1,
+                child: Container(
+                  height: 130,
+                  decoration: BoxDecoration(
+                    color: context.appColors.surfaceFill,
+                    borderRadius: BorderRadius.circular(12),
+                    border: Border.all(
+                      color: cs.outlineVariant.withValues(alpha: 0.35),
+                    ),
                   ),
-                ),
-                focusedBorder: OutlineInputBorder(
-                  borderRadius: BorderRadius.circular(12),
-                  borderSide: BorderSide(
-                    color: cs.primary.withValues(alpha: 0.5),
+                  child: PlainTextCodeEditor(
+                    controller: _tmplCtrl,
+                    focusNode: _tmplFocus,
+                    hint: '{{ message }}',
+                    padding: const EdgeInsets.fromLTRB(12, 12, 12, 12),
+                    borderRadius: BorderRadius.circular(12),
+                    onChanged: (_) => _onMessageTemplateChanged(),
                   ),
                 ),
               ),
@@ -555,10 +655,12 @@ class _PromptTabState extends State<_PromptTab> {
                 onTapVar: a.enableTimeInjection
                     ? (_) {}
                     : (v) {
-                        _insertAtCursor(_tmplCtrl, v);
-                        context.read<AssistantProvider>().updateAssistant(
-                          a.copyWith(messageTemplate: _tmplCtrl.text),
+                        _insertAtCursor(
+                          _tmplCtrl,
+                          _tmplEditorHasBeenFocused,
+                          v,
                         );
+                        _schedulePromptSave(messageTemplate: _tmplCtrl.text);
                         Future.microtask(() => _tmplFocus.requestFocus());
                       },
               ),
